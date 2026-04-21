@@ -172,6 +172,24 @@ function build(): CVATCore {
                 const result = await PluginRegistry.apiWrapper(cvat.frames.getMeta, type, id);
                 return result;
             },
+            async getHyperspectralMeta(jobID: number) {
+                const result = await PluginRegistry.apiWrapper(
+                    cvat.frames.getHyperspectralMeta, jobID,
+                );
+                return result;
+            },
+            async setHyperspectralBands(
+                jobID: number,
+                bands: {
+                    rBand: number; gBand: number; bBand: number;
+                    stretchLo?: number; stretchHi?: number;
+                } | null,
+            ) {
+                const result = await PluginRegistry.apiWrapper(
+                    cvat.frames.setHyperspectralBands, jobID, bands,
+                );
+                return result;
+            },
         },
         users: {
             async get(filter = {}) {

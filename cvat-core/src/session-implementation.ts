@@ -65,6 +65,42 @@ async function restoreFrameWrapper(jobID, frame): Promise<void> {
     }, redo, [], frame);
 }
 
+// Per-job hyperspectral band selection. Lives in-memory only — the UI is
+// expected to persist its own Redux slice (with localStorage). This map is
+// the trust root for what the current chunk() call will ask the server to
+// render. `undefined` entries mean "use server defaults" (warm cache).
+const jobHyperspectralBands: Record<number, {
+    rBand: number;
+    gBand: number;
+    bBand: number;
+    stretchLo?: number;
+    stretchHi?: number;
+}> = {};
+
+function getHyperspectralBands(jobID: number) {
+    return jobHyperspectralBands[jobID];
+}
+
+export function setHyperspectralBands(
+    jobID: number,
+    bands: { rBand: number; gBand: number; bBand: number; stretchLo?: number; stretchHi?: number } | null,
+): void {
+    if (bands === null) {
+        delete jobHyperspectralBands[jobID];
+    } else {
+        jobHyperspectralBands[jobID] = { ...bands };
+    }
+    // Drop decoded-frame cache so the next frame request goes back to the
+    // server with the new band params.
+    clearFrames(jobID);
+}
+
+export async function getHyperspectralMeta(
+    jobID: number,
+): ReturnType<typeof serverProxy.frames.getHyperspectralMeta> {
+    return serverProxy.frames.getHyperspectralMeta(jobID);
+}
+
 export function implementJob(Job: typeof JobClass): typeof JobClass {
     Object.defineProperty(Job.prototype.save, 'implementation', {
         value: async function saveImplementation(
@@ -310,7 +346,12 @@ export function implementJob(Job: typeof JobClass): typeof JobClass {
             chunkIndex: Parameters<typeof JobClass.prototype.frames.chunk>[0],
             quality: Parameters<typeof JobClass.prototype.frames.chunk>[1],
         ): ReturnType<typeof JobClass.prototype.frames.chunk> {
-            return serverProxy.frames.getData(this.id, chunkIndex, quality);
+            // The band state is read at call time — when the UI updates the
+            // map and invalidates the local frame cache, the next chunk fetch
+            // picks up the new parameters automatically.
+            return serverProxy.frames.getData(
+                this.id, chunkIndex, quality, getHyperspectralBands(this.id),
+            );
         },
     });
 
