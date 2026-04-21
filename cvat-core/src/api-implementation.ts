@@ -40,6 +40,10 @@ import AboutData from './about';
 import QualityConflict, { ConflictSeverity } from './quality-conflict';
 import QualitySettings from './quality-settings';
 import { getFramesMeta } from './frames';
+import {
+    getHyperspectralMeta as getHyperspectralMetaImpl,
+    setHyperspectralBands as setHyperspectralBandsImpl,
+} from './session-implementation';
 import ConsensusSettings from './consensus-settings';
 import {
     callAction, listActions, registerAction, unregisterAction, runAction,
@@ -578,6 +582,18 @@ export default function implementAPI(cvat: CVATCore): CVATCore {
     implementationMixin(cvat.frames.getMeta, async (type: 'job' | 'task', id: number) => {
         const result = await getFramesMeta(type, id);
         return result;
+    });
+    implementationMixin(cvat.frames.getHyperspectralMeta, async (jobID: number) => {
+        return getHyperspectralMetaImpl(jobID);
+    });
+    implementationMixin(cvat.frames.setHyperspectralBands, (
+        jobID: number,
+        bands: {
+            rBand: number; gBand: number; bBand: number;
+            stretchLo?: number; stretchHi?: number;
+        } | null,
+    ) => {
+        setHyperspectralBandsImpl(jobID, bands);
     });
 
     return cvat;

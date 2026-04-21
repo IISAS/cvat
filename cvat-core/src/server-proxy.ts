@@ -1597,17 +1597,44 @@ async function getImageContext(jid: number, frame: number): Promise<ArrayBuffer>
     }
 }
 
-async function getData(jid: number, chunk: number, quality: ChunkQuality, retry = 0): Promise<ArrayBuffer> {
+export interface HyperspectralBandOptions {
+    rBand: number;
+    gBand: number;
+    bBand: number;
+    stretchLo?: number;
+    stretchHi?: number;
+}
+
+async function getData(
+    jid: number,
+    chunk: number,
+    quality: ChunkQuality,
+    bands?: HyperspectralBandOptions,
+    retry = 0,
+): Promise<ArrayBuffer> {
     const { backendAPI } = config;
 
     try {
+        const params: Record<string, unknown> = {
+            ...enableOrganization(),
+            quality,
+            type: 'chunk',
+            index: chunk,
+        };
+        if (bands) {
+            // Sending partial band tuples is a server error by design; if a
+            // caller provides a band object at all, all three indices are
+            // required. Stretch is optional — server falls back to defaults.
+            params.r_band = bands.rBand;
+            params.g_band = bands.gBand;
+            params.b_band = bands.bBand;
+            if (bands.stretchLo !== undefined && bands.stretchHi !== undefined) {
+                params.stretch_lo = bands.stretchLo;
+                params.stretch_hi = bands.stretchHi;
+            }
+        }
         const response = await (workerAxios as any).get(`${backendAPI}/jobs/${jid}/data`, {
-            params: {
-                ...enableOrganization(),
-                quality,
-                type: 'chunk',
-                index: chunk,
-            },
+            params,
             responseType: 'arraybuffer',
         });
 
@@ -1623,7 +1650,7 @@ async function getData(jid: number, chunk: number, quality: ChunkQuality, retry 
                         `Body size: ${response.data.byteLength}`,
                     );
                 });
-                return await getData(jid, chunk, quality, retry + 1);
+                return await getData(jid, chunk, quality, bands, retry + 1);
             }
 
             // not to try anymore, throw explicit error
@@ -1633,6 +1660,33 @@ async function getData(jid: number, chunk: number, quality: ChunkQuality, retry 
             );
         }
 
+        return response.data;
+    } catch (errorData) {
+        throw generateError(errorData);
+    }
+}
+
+export interface SerializedHyperspectralFrameMeta {
+    frame: number;
+    band_count: number;
+    lines: number;
+    samples: number;
+    interleave: string;
+    dtype: string;
+    default_r_band: number;
+    default_g_band: number;
+    default_b_band: number;
+    default_stretch: string[] | null;
+    wavelengths: number[] | null;
+    data_ignore_value: number | null;
+}
+
+async function getHyperspectralMeta(
+    jid: number,
+): Promise<{ frames: SerializedHyperspectralFrameMeta[] }> {
+    const { backendAPI } = config;
+    try {
+        const response = await Axios.get(`${backendAPI}/jobs/${jid}/data/hyperspectral-meta`);
         return response.data;
     } catch (errorData) {
         throw generateError(errorData);
@@ -2550,6 +2604,7 @@ export default Object.freeze({
         saveMeta,
         getPreview,
         getImageContext,
+        getHyperspectralMeta,
     }),
 
     annotations: Object.freeze({
