@@ -354,8 +354,29 @@ class MediaCache:
         chunk_number: int,
         *,
         quality: models.FrameQuality,
+        hyperspectral_signature: str | None = None,
     ) -> str:
-        return f"{cls._make_cache_key_prefix(db_obj)}_chunk_{chunk_number}_{quality}"
+        key = f"{cls._make_cache_key_prefix(db_obj)}_chunk_{chunk_number}_{quality}"
+        # Hyperspectral band/stretch signature is appended only for non-default
+        # requests, so default-band chunks built at task creation retain their
+        # original key and stay warm.
+        if hyperspectral_signature:
+            key = f"{key}_hs_{hyperspectral_signature}"
+        return key
+
+    @staticmethod
+    def _hyperspectral_signature(
+        bands: tuple[int, int, int] | None,
+        stretch: tuple[float, float] | None,
+    ) -> str | None:
+        """Stable key fragment for a band + stretch combo. ``None`` when both
+        are ``None`` — signalling "use default-band chunks".
+        """
+        if bands is None and stretch is None:
+            return None
+        r, g, b = bands if bands is not None else (-1, -1, -1)
+        lo, hi = stretch if stretch is not None else (-1.0, -1.0)
+        return f"{r}_{g}_{b}_{lo:g}_{hi:g}"
 
     def _make_preview_key(self, db_obj: models.Segment | models.CloudStorage) -> str:
         return f"{self._make_cache_key_prefix(db_obj)}_preview"
@@ -401,6 +422,45 @@ class MediaCache:
                 callable=self.prepare_segment_chunk,
                 args=[db_segment, chunk_number],
                 kwargs={"quality": quality},
+            ),
+        )
+        db_segment.refresh_from_db(fields=["chunks_updated_date"])
+
+        return self._to_data_with_mime(
+            self._validate_cache_item_timestamp(item, db_segment.chunks_updated_date)
+        )
+
+    def get_or_set_hyperspectral_segment_chunk(
+        self,
+        db_segment: models.Segment,
+        chunk_number: int,
+        *,
+        quality: models.FrameQuality,
+        bands: tuple[int, int, int] | None = None,
+        stretch: tuple[float, float] | None = None,
+    ) -> DataWithMime:
+        """Chunk getter for hyperspectral tasks with custom band / stretch.
+
+        When ``bands`` and ``stretch`` are both ``None``, defers entirely to
+        :meth:`get_or_set_segment_chunk` so default-band chunks (built by
+        :class:`EnviBsqReader` during task creation) keep their existing cache
+        key and warm state. When either is set, the key is extended with a
+        ``_hs_<sig>`` suffix and a miss re-renders the chunk from the raw cube.
+        """
+        signature = self._hyperspectral_signature(bands, stretch)
+        if signature is None:
+            return self.get_or_set_segment_chunk(
+                db_segment, chunk_number, quality=quality
+            )
+
+        item = self._get_or_set_cache_item(
+            self._make_chunk_key(
+                db_segment, chunk_number, quality=quality, hyperspectral_signature=signature
+            ),
+            Callback(
+                callable=self.prepare_hyperspectral_segment_chunk,
+                args=[db_segment, chunk_number],
+                kwargs={"quality": quality, "bands": bands, "stretch": stretch},
             ),
         )
         db_segment.refresh_from_db(fields=["chunks_updated_date"])
@@ -791,6 +851,57 @@ class MediaCache:
         else:
             yield from MediaCache.read_raw_images(db_task, frame_ids)
 
+    @staticmethod
+    def _read_raw_hyperspectral_frames(
+        db_task: models.Task,
+        frame_ids: Sequence[int],
+        *,
+        bands: tuple[int, int, int] | None,
+        stretch: tuple[float, float] | None,
+    ) -> Generator[tuple[PIL.Image.Image, str], None, None]:
+        """Yield (PIL RGBA image, path) per frame, rendered fresh from the cube.
+
+        Each frame's :class:`HyperspectralMetadata` row holds the absolute path
+        to the on-disk cube and HDR; :func:`compose_rgba` memory-maps the cube
+        and reads only the requested bands.
+        """
+        from cvat.apps.engine.hyperspectral import HyperspectralHeaderInfo, compose_rgba
+
+        db_data = db_task.require_data()
+        hs_rows = (
+            models.HyperspectralMetadata.objects
+            .filter(image__data=db_data, image__frame__in=frame_ids)
+            .select_related("image")
+            .order_by("image__frame")
+        )
+
+        for row in hs_rows:
+            info = HyperspectralHeaderInfo(
+                band_count=row.band_count,
+                lines=row.lines,
+                samples=row.samples,
+                interleave=row.interleave,
+                dtype=row.dtype,
+                default_r_band=row.default_r_band,
+                default_g_band=row.default_g_band,
+                default_b_band=row.default_b_band,
+                default_stretch=row.default_stretch,
+                wavelengths=row.wavelengths,
+                data_ignore_value=row.data_ignore_value,
+                crs_wkt=row.crs_wkt,
+                map_info=row.map_info,
+            )
+            r, g, b = bands if bands is not None else (
+                info.default_r_band, info.default_g_band, info.default_b_band,
+            )
+            lo, hi = stretch if stretch is not None else (None, None)
+            pil = compose_rgba(
+                row.data_file_path, row.hdr_file_path, info,
+                r_band=r, g_band=g, b_band=b,
+                stretch_lo_pct=lo, stretch_hi_pct=hi,
+            )
+            yield pil, row.data_file_path
+
     def prepare_segment_chunk(
         self,
         db_segment: models.Segment | int,
@@ -809,6 +920,36 @@ class MediaCache:
             )
         else:
             assert False, f"Unknown segment type {db_segment.type}"
+
+    def prepare_hyperspectral_segment_chunk(
+        self,
+        db_segment: models.Segment | int,
+        chunk_number: int,
+        *,
+        quality: models.FrameQuality,
+        bands: tuple[int, int, int] | None,
+        stretch: tuple[float, float] | None,
+    ) -> DataWithMime:
+        """Build a chunk whose frames are rendered on demand from raw cubes.
+
+        Always composites freshly — the whole point of custom-band requests is
+        that they bypass the pre-built default chunks. The resulting chunk is
+        cached under the hyperspectral-signed key by the caller.
+        """
+        if isinstance(db_segment, int):
+            db_segment = models.Segment.objects.get(pk=db_segment)
+        db_task = db_segment.task
+        db_data = db_task.require_data()
+
+        chunk_size = db_data.chunk_size
+        chunk_frame_ids = list(db_segment.frame_set)[
+            chunk_size * chunk_number : chunk_size * (chunk_number + 1)
+        ]
+
+        frame_iter = self._read_raw_hyperspectral_frames(
+            db_task, chunk_frame_ids, bands=bands, stretch=stretch,
+        )
+        return prepare_chunk(frame_iter, quality=quality, db_task=db_task)
 
     def prepare_range_segment_chunk(
         self, db_segment: models.Segment, chunk_number: int, *, quality: models.FrameQuality

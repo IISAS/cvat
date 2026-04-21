@@ -63,6 +63,11 @@ video/vnd.mpegurl	m4u
 video/mp4	m4v
 video/mxf	mxf
 
+# ENVI hyperspectral imagery (BSQ/BIL/BIP). The .hdr sidecar keeps its existing
+# image/x-hdr mapping; pair resolution happens in engine/task.py validation.
+image/x-envi-bsq	bsq
+image/x-envi-img	img
+
 # possible image formats
 image/x-minolta-mrw	mrw
 image/x-sgi	sgi

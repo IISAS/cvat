@@ -31,6 +31,7 @@ from cvat.apps.engine.log import ServerLogManager
 from cvat.apps.engine.media_extractors import (
     MEDIA_TYPES,
     CachingMediaIterator,
+    EnviBsqReader,
     ImageListReader,
     IMediaReader,
     Mpeg4ChunkWriter,
@@ -294,7 +295,48 @@ def _find_manifest_files(data):
     return manifest_files
 
 
+def _validate_hyperspectral_pairs(files: list[str]) -> None:
+    """Every cube file (.bsq/.img/.bil/.bip) must have a matching .hdr sidecar
+    (or be a .zip with the pair inside; zips were pre-validated at
+    classification time). A lone .hdr with no cube is rejected — it's either a
+    misnamed upload or a missing-file mistake.
+    """
+    from cvat.apps.engine.hyperspectral import CUBE_SUFFIXES
+
+    stems_with_cube: set[str] = set()
+    stems_with_hdr: set[str] = set()
+    for f in files:
+        base = os.path.basename(f)
+        stem, suffix = os.path.splitext(base)
+        suffix = suffix.lower()
+        if suffix in CUBE_SUFFIXES:
+            stems_with_cube.add(stem.lower())
+        elif suffix == ".hdr":
+            stems_with_hdr.add(stem.lower())
+        # .zip entries are validated by _is_hyperspectral at classification time.
+
+    missing_hdr = stems_with_cube - stems_with_hdr
+    if missing_hdr:
+        raise ValueError(
+            "Hyperspectral cube(s) without a matching .hdr: "
+            + ", ".join(sorted(missing_hdr))
+        )
+    orphan_hdr = stems_with_hdr - stems_with_cube
+    # A .hdr with no cube is only an error when there are no zipped bundles in
+    # the batch. We can't cheaply tell here whether some zip happens to contain
+    # a cube with this HDR's name; in practice users either upload cube+hdr
+    # pairs as loose files or as a zipped bundle, not both.
+    if orphan_hdr and not any(f.lower().endswith(".zip") for f in files):
+        raise ValueError(
+            ".hdr file(s) without a matching cube (.bsq/.img/.bil/.bip): "
+            + ", ".join(sorted(orphan_hdr))
+        )
+
+
 def _validate_data(counter, manifest_files=None):
+    if counter.get("hyperspectral"):
+        _validate_hyperspectral_pairs(counter["hyperspectral"])
+
     unique_entries = 0
     multiple_entries = 0
     for media_type, media_config in MEDIA_TYPES.items():
@@ -1668,6 +1710,32 @@ def create_thread(
         )
 
         images = bulk_create(models.Image, images)
+
+        if isinstance(extractor, EnviBsqReader):
+            hs_rows = []
+            for img in images:
+                info = extractor.get_header_info(img.frame)
+                hs_rows.append(
+                    models.HyperspectralMetadata(
+                        image=img,
+                        band_count=info.band_count,
+                        lines=info.lines,
+                        samples=info.samples,
+                        interleave=info.interleave,
+                        dtype=info.dtype,
+                        default_r_band=info.default_r_band,
+                        default_g_band=info.default_g_band,
+                        default_b_band=info.default_b_band,
+                        default_stretch=info.default_stretch,
+                        wavelengths=info.wavelengths,
+                        data_ignore_value=info.data_ignore_value,
+                        crs_wkt=info.crs_wkt,
+                        map_info=info.map_info,
+                        data_file_path=os.path.abspath(extractor.get_path(img.frame)),
+                        hdr_file_path=os.path.abspath(extractor.get_hdr_path(img.frame)),
+                    )
+                )
+            bulk_create(models.HyperspectralMetadata, hs_rows)
 
         db_related_files = [
             models.RelatedFile(
