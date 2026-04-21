@@ -121,6 +121,7 @@ from cvat.apps.engine.serializers import (
     DataSerializer,
     DatasetFileSerializer,
     FileInfoSerializer,
+    HyperspectralMetaResponseSerializer,
     IssueReadSerializer,
     IssueWriteSerializer,
     JobDataMetaWriteSerializer,
@@ -525,9 +526,65 @@ class ProjectViewSet(viewsets.GenericViewSet, mixins.ListModelMixin,
 
         return response
 
+def _parse_hyperspectral_query_params(
+    query_params,
+) -> tuple[tuple[int, int, int] | None, tuple[float, float] | None]:
+    """Pull optional hyperspectral band + stretch params from a querystring.
+
+    Returns ``(bands_or_None, stretch_or_None)``. A caller interprets
+    ``(None, None)`` as "use default-band chunks" so the warm cache is hit.
+    Partially specified band triples (one or two of the three) are an error.
+    """
+    def _opt_int(name):
+        v = query_params.get(name)
+        if v is None or v == '':
+            return None
+        try:
+            return int(v)
+        except ValueError:
+            raise ValidationError(f"Invalid integer for '{name}': {v!r}")
+
+    def _opt_float(name):
+        v = query_params.get(name)
+        if v is None or v == '':
+            return None
+        try:
+            return float(v)
+        except ValueError:
+            raise ValidationError(f"Invalid float for '{name}': {v!r}")
+
+    r = _opt_int('r_band')
+    g = _opt_int('g_band')
+    b = _opt_int('b_band')
+    band_present = [x is not None for x in (r, g, b)]
+    if any(band_present) and not all(band_present):
+        raise ValidationError("r_band, g_band and b_band must be supplied together")
+    bands = (r, g, b) if all(band_present) else None
+    if bands is not None and any(x < 0 for x in bands):
+        raise ValidationError("band indices must be non-negative")
+
+    lo = _opt_float('stretch_lo')
+    hi = _opt_float('stretch_hi')
+    if (lo is None) != (hi is None):
+        raise ValidationError("stretch_lo and stretch_hi must be supplied together")
+    stretch = (lo, hi) if lo is not None else None
+    if stretch is not None and not (0.0 <= lo < hi <= 100.0):
+        raise ValidationError(
+            "stretch_lo/stretch_hi must satisfy 0 <= stretch_lo < stretch_hi <= 100"
+        )
+
+    return bands, stretch
+
+
 class _DataGetter(metaclass=ABCMeta):
     def __init__(
-        self, data_type: str, data_num: str | int | None, data_quality: str
+        self,
+        data_type: str,
+        data_num: str | int | None,
+        data_quality: str,
+        *,
+        hyperspectral_bands: tuple[int, int, int] | None = None,
+        hyperspectral_stretch: tuple[float, float] | None = None,
     ) -> None:
         possible_data_type_values = ('chunk', 'frame', 'preview', 'context_image')
         possible_quality_values = ('compressed', 'original')
@@ -544,6 +601,8 @@ class _DataGetter(metaclass=ABCMeta):
         self.number = int(data_num) if data_num is not None else None
         self.quality = FrameQuality.COMPRESSED \
             if data_quality == 'compressed' else FrameQuality.ORIGINAL
+        self.hyperspectral_bands = hyperspectral_bands
+        self.hyperspectral_stretch = hyperspectral_stretch
 
     @abstractmethod
     def _get_frame_provider(self) -> IFrameProvider: ...
@@ -553,7 +612,15 @@ class _DataGetter(metaclass=ABCMeta):
 
         try:
             if self.type == 'chunk':
-                data = frame_provider.get_chunk(self.number, quality=self.quality)
+                if self.hyperspectral_bands is not None or self.hyperspectral_stretch is not None:
+                    data = frame_provider.get_hyperspectral_chunk(
+                        self.number,
+                        quality=self.quality,
+                        bands=self.hyperspectral_bands,
+                        stretch=self.hyperspectral_stretch,
+                    )
+                else:
+                    data = frame_provider.get_chunk(self.number, quality=self.quality)
                 return HttpResponse(
                     data.data.getvalue(),
                     content_type=data.mime,
@@ -621,8 +688,16 @@ class _TaskDataGetter(_DataGetter):
         data_type: str,
         data_quality: str,
         data_num: str | int | None = None,
+        hyperspectral_bands: tuple[int, int, int] | None = None,
+        hyperspectral_stretch: tuple[float, float] | None = None,
     ) -> None:
-        super().__init__(data_type=data_type, data_num=data_num, data_quality=data_quality)
+        super().__init__(
+            data_type=data_type,
+            data_num=data_num,
+            data_quality=data_quality,
+            hyperspectral_bands=hyperspectral_bands,
+            hyperspectral_stretch=hyperspectral_stretch,
+        )
         self._db_task = db_task
 
     def _get_frame_provider(self) -> TaskFrameProvider:
@@ -643,6 +718,8 @@ class _JobDataGetter(_DataGetter):
         data_quality: str,
         data_num: str | int | None = None,
         data_index: str | int | None = None,
+        hyperspectral_bands: tuple[int, int, int] | None = None,
+        hyperspectral_stretch: tuple[float, float] | None = None,
     ) -> None:
         possible_data_type_values = ('chunk', 'frame', 'preview', 'context_image')
         possible_quality_values = ('compressed', 'original')
@@ -668,6 +745,9 @@ class _JobDataGetter(_DataGetter):
         self.quality = FrameQuality.COMPRESSED \
             if data_quality == 'compressed' else FrameQuality.ORIGINAL
 
+        self.hyperspectral_bands = hyperspectral_bands
+        self.hyperspectral_stretch = hyperspectral_stretch
+
         self._db_job = db_job
 
     def _get_frame_provider(self) -> JobFrameProvider:
@@ -679,7 +759,21 @@ class _JobDataGetter(_DataGetter):
             frame_provider = self._get_frame_provider()
 
             try:
-                if self.index is not None:
+                hyperspectral_active = (
+                    self.hyperspectral_bands is not None or self.hyperspectral_stretch is not None
+                )
+                if hyperspectral_active:
+                    # Hyperspectral custom-band requests always index by the
+                    # segment-local chunk number; task-chunk reshuffling across
+                    # segments is out of scope for MVP.
+                    chunk_idx = self.index if self.index is not None else self.number
+                    data = frame_provider.get_hyperspectral_chunk(
+                        chunk_idx,
+                        quality=self.quality,
+                        bands=self.hyperspectral_bands,
+                        stretch=self.hyperspectral_stretch,
+                    )
+                elif self.index is not None:
                     data = frame_provider.get_chunk(
                         self.index, quality=self.quality, is_task_chunk=False
                     )
@@ -1281,9 +1375,11 @@ class TaskViewSet(viewsets.GenericViewSet, mixins.ListModelMixin,
             data_type = request.query_params.get('type', None)
             data_num = request.query_params.get('number', None)
             data_quality = request.query_params.get('quality', 'compressed')
+            hs_bands, hs_stretch = _parse_hyperspectral_query_params(request.query_params)
 
             data_getter = _TaskDataGetter(
-                self._object, data_type=data_type, data_num=data_num, data_quality=data_quality
+                self._object, data_type=data_type, data_num=data_num, data_quality=data_quality,
+                hyperspectral_bands=hs_bands, hyperspectral_stretch=hs_stretch,
             )
             return data_getter()
 
@@ -1923,11 +2019,13 @@ class JobViewSet(viewsets.GenericViewSet, mixins.ListModelMixin, mixins.CreateMo
         data_num = request.query_params.get('number', None)
         data_index = request.query_params.get('index', None)
         data_quality = request.query_params.get('quality', 'compressed')
+        hs_bands, hs_stretch = _parse_hyperspectral_query_params(request.query_params)
 
         data_getter = _JobDataGetter(
             db_job,
             data_type=data_type, data_quality=data_quality,
-            data_index=data_index, data_num=data_num
+            data_index=data_index, data_num=data_num,
+            hyperspectral_bands=hs_bands, hyperspectral_stretch=hs_stretch,
         )
         return data_getter()
 
@@ -2046,6 +2144,31 @@ class JobViewSet(viewsets.GenericViewSet, mixins.ListModelMixin, mixins.CreateMo
             data_quality='compressed',
         )
         return data_getter()
+
+    @extend_schema(
+        methods=['GET'],
+        summary='Get hyperspectral metadata for frames in a job',
+        description=textwrap.dedent("""\
+            Returns per-frame band/wavelength/stretch metadata for hyperspectral
+            tasks. Empty ``frames`` list for non-hyperspectral jobs.
+        """),
+        responses={
+            '200': HyperspectralMetaResponseSerializer,
+        })
+    @action(detail=True, methods=['GET'], url_path='data/hyperspectral-meta')
+    def hyperspectral_meta(self, request: ExtendedRequest, pk: int):
+        self.get_object()  # enforce permissions
+        db_job = models.Job.objects.select_related('segment', 'segment__task').get(pk=pk)
+        db_segment = db_job.segment
+        segment_frame_set = db_segment.frame_set
+        hs_rows = (
+            models.HyperspectralMetadata.objects
+            .filter(image__data=db_segment.task.data, image__frame__in=segment_frame_set)
+            .select_related('image')
+            .order_by('image__frame')
+        )
+        serializer = HyperspectralMetaResponseSerializer({'frames': hs_rows})
+        return Response(serializer.data)
 
     @extend_schema(
         methods=["GET"],

@@ -2956,6 +2956,35 @@ class PluginsSerializer(serializers.Serializer):
     MODELS = serializers.BooleanField()
     PREDICT = serializers.BooleanField()
 
+class HyperspectralFrameMetaSerializer(serializers.ModelSerializer):
+    """Per-frame hyperspectral metadata. ``frame`` is the frame number within
+    the task; everything else mirrors the HDR fields the renderer needs.
+    """
+    frame = serializers.IntegerField(source='image.frame')
+
+    class Meta:
+        model = models.HyperspectralMetadata
+        fields = (
+            'frame',
+            'band_count',
+            'lines',
+            'samples',
+            'interleave',
+            'dtype',
+            'default_r_band',
+            'default_g_band',
+            'default_b_band',
+            'default_stretch',
+            'wavelengths',
+            'data_ignore_value',
+        )
+        read_only_fields = fields
+
+
+class HyperspectralMetaResponseSerializer(serializers.Serializer):
+    frames = HyperspectralFrameMetaSerializer(many=True)
+
+
 class DataMetaReadSerializer(serializers.ModelSerializer):
     frames = FrameMetaSerializer(many=True, allow_null=True)
     chapters = ChapterSerializer(many=True, allow_null=True, required=False)

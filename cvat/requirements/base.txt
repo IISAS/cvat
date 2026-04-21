@@ -329,6 +329,8 @@ shapely==1.7.1
     # via
     #   -r cvat/requirements/base.in
     #   datumaro
+spectral==0.23.1
+    # via -r cvat/requirements/base.in
 six==1.17.0
     # via
     #   azure-core

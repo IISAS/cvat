@@ -559,6 +559,48 @@ class Image(models.Model):
     class Meta:
         default_permissions = ()
 
+
+class HyperspectralMetadata(models.Model):
+    """Per-scene metadata for ENVI hyperspectral imagery (BSQ/BIL/BIP).
+
+    Populated at task-creation time from the ENVI header. Values here drive the
+    server-side RGB compositor and the client-side band-selection UI. The
+    original cube is not stored inline — `data_file_path` points at the on-disk
+    BSQ, which is memory-mapped on each chunk render.
+    """
+    image = models.OneToOneField(
+        Image, on_delete=models.CASCADE, related_name="hyperspectral", primary_key=True,
+    )
+    band_count = models.PositiveIntegerField()
+    lines = models.PositiveIntegerField()
+    samples = models.PositiveIntegerField()
+    # 'bsq' | 'bil' | 'bip' — matches ENVI 'interleave' field, normalized lower-case
+    interleave = models.CharField(max_length=3)
+    # NumPy dtype string (e.g. 'float32', 'uint16'). Derived from ENVI 'data type'.
+    dtype = models.CharField(max_length=16)
+    # Initial R/G/B band indices (0-based). Seeded from HDR 'default bands' when
+    # present, otherwise picked by wavelength proximity to 650/550/450 nm, with
+    # 3/4–1/2–1/4 band-count fallback if wavelengths are absent too.
+    default_r_band = models.PositiveIntegerField()
+    default_g_band = models.PositiveIntegerField()
+    default_b_band = models.PositiveIntegerField()
+    # ENVI 'default stretch' as raw tokens (e.g. ["2.0", "%", "linear"]). Null
+    # means "no stretch specified in HDR"; client falls back to 2–98 percentile.
+    default_stretch = models.JSONField(null=True, blank=True)
+    # Per-band center wavelengths in nm, in band order. Null if HDR had no array.
+    wavelengths = models.JSONField(null=True, blank=True)
+    # Sentinel pixel value treated as nodata → rendered transparent.
+    data_ignore_value = models.FloatField(null=True, blank=True)
+    # Optional georeferencing, passed through as-is for later export/overlay.
+    crs_wkt = models.TextField(null=True, blank=True)
+    map_info = models.JSONField(null=True, blank=True)
+    # Absolute paths to the cube and its header, resolved at upload time.
+    data_file_path = models.CharField(max_length=1024)
+    hdr_file_path = models.CharField(max_length=1024)
+
+    class Meta:
+        default_permissions = ()
+
 class AssignableModel(models.Model):
     assignee = models.ForeignKey(
         User, null=True, blank=True, on_delete=models.SET_NULL,

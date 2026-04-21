@@ -584,6 +584,162 @@ class ZipReader(ImageListReader):
             os.remove(self._zip_source.filename)
 
 
+class EnviBsqReader(IMediaReader):
+    """Reader for ENVI hyperspectral cubes (BSQ / BIL / BIP).
+
+    Each input source is one scene — either a ``.bsq``/``.img``/``.bil``/``.bip``
+    file with a sibling ``.hdr``, or a ``.zip`` containing exactly one cube and
+    one HDR. Sibling ``.hdr`` files that appear in ``source_paths`` are ignored
+    here; they are resolved per-cube via filename pairing. Each cube becomes one
+    frame in the task. ``get_image(i)`` renders the HDR's default-band RGB
+    composite (with percentile stretch, NaN → transparent) as PNG bytes, which
+    the chunk builder treats like any other image.
+
+    Dynamic (non-default) band composites are not rendered here — they are
+    produced on demand by the cache layer, which calls
+    :func:`cvat.apps.engine.hyperspectral.compose_rgba` directly against the
+    on-disk cube using the persisted ``HyperspectralMetadata`` row.
+    """
+
+    def __init__(
+        self,
+        source_paths: Sequence[Path],
+        step: int = 1,
+        start: int = 0,
+        stop: int | None = None,
+        dimension: DimensionType = DimensionType.DIM_2D,
+        sorting_method: SortingMethod = SortingMethod.LEXICOGRAPHICAL,
+        extract_dir: str | None = None,
+    ):
+        from cvat.apps.engine.hyperspectral import (
+            CUBE_SUFFIXES,
+            HyperspectralError,
+            compose_rgba,
+            extract_header_info,
+            find_hdr_sibling,
+            find_pair_in_zip,
+            is_hyperspectral_zip,
+            read_header_from_path,
+        )
+        self._compose_rgba = compose_rgba
+
+        cube_paths: list[Path] = []
+        for raw in source_paths:
+            p = Path(raw)
+            suffix = p.suffix.lower()
+            if suffix in CUBE_SUFFIXES:
+                cube_paths.append(p)
+            elif suffix == ".zip" and is_hyperspectral_zip(p):
+                target_dir = Path(extract_dir) if extract_dir else p.parent
+                target_dir.mkdir(parents=True, exist_ok=True)
+                pair = find_pair_in_zip(p)
+                if pair is None:
+                    raise ValidationError(f"{p.name}: zip does not contain a BSQ+HDR pair")
+                cube_name, hdr_name = pair
+                with zipfile.ZipFile(p, "r") as zf:
+                    # extract alongside, preserving inner filenames so users
+                    # can identify scenes in the task.
+                    zf.extract(cube_name, target_dir)
+                    zf.extract(hdr_name, target_dir)
+                cube_paths.append(target_dir / cube_name)
+                if not extract_dir:
+                    p.unlink(missing_ok=True)
+            # .hdr files are skipped — they are sidecars, paired per-cube below.
+
+        if not cube_paths:
+            raise Exception("No hyperspectral cube found")
+
+        cube_paths = sort(cube_paths, sorting_method, os.fspath)
+
+        # Resolve each cube's HDR, parse it, keep the typed record alongside.
+        self._entries: list[tuple[Path, Path, Any]] = []
+        for cube in cube_paths:
+            hdr = find_hdr_sibling(cube)
+            if hdr is None:
+                raise ValidationError(f"{cube.name}: no matching .hdr file found")
+            try:
+                info = extract_header_info(read_header_from_path(hdr))
+            except HyperspectralError as e:
+                raise ValidationError(f"{cube.name}: {e}") from None
+            self._entries.append((cube, hdr, info))
+
+        if not stop:
+            stop = len(self._entries) - 1
+        else:
+            stop = min(len(self._entries) - 1, stop)
+        step = max(step, 1)
+        assert stop >= start
+
+        super().__init__(
+            step=step,
+            start=start,
+            stop=stop,
+            dimension=dimension,
+        )
+
+        self._sorting_method = sorting_method
+        self._render_cache: dict[int, bytes] = {}
+
+    def __iter__(self) -> Iterator[IMediaReader.ImageFrame]:
+        for i in self.frame_range:
+            yield (self.get_image(i), self.get_path(i))
+
+    def __contains__(self, media_file):
+        return any(Path(media_file) == cube for cube, _, _ in self._entries)
+
+    def __len__(self):
+        return len(self.frame_range)
+
+    @property
+    def frame_range(self):
+        return range(self._start, self._stop + 1, self._step)
+
+    @property
+    def absolute_source_paths(self):
+        return [self.get_path(i) for i in range(len(self._entries))]
+
+    def get_path(self, i: int) -> Path:
+        return self._entries[i][0]
+
+    def get_header_info(self, i: int):
+        return self._entries[i][2]
+
+    def get_hdr_path(self, i: int) -> Path:
+        return self._entries[i][1]
+
+    def get_image(self, i: int) -> io.BytesIO:
+        """Render the default-band RGBA composite once, then serve from cache.
+
+        A single scene's PNG is reused for every ``get_image(i)`` within one
+        task-creation pass — the compose call reads three bands off disk, which
+        is cheap for BSQ but not free for BIL/BIP.
+        """
+        if i not in self._render_cache:
+            cube, hdr, info = self._entries[i]
+            pil_img = self._compose_rgba(cube, hdr, info)
+            buf = io.BytesIO()
+            pil_img.save(buf, format="PNG")
+            self._render_cache[i] = buf.getvalue()
+        return io.BytesIO(self._render_cache[i])
+
+    def get_image_size(self, i: int) -> tuple[int, int]:
+        info = self._entries[i][2]
+        return (info.samples, info.lines)
+
+    def reconcile(
+        self, source_paths, step=1, start=0, stop=None, dimension=None, sorting_method=None
+    ):
+        EnviBsqReader.__init__(
+            self,
+            source_paths=source_paths,
+            step=step,
+            start=start,
+            stop=stop,
+            sorting_method=sorting_method if sorting_method else self._sorting_method,
+            dimension=dimension if dimension else self._dimension,
+        )
+
+
 class VideoReader(IMediaReader):
     def __init__(
         self,
@@ -1161,6 +1317,24 @@ def _is_zip(path):
     return mime_type in supportedArchives or encoding in supportedArchives
 
 
+def _is_hyperspectral(path):
+    """Match ENVI hyperspectral inputs: a cube file, its HDR sidecar, or a
+    .zip containing exactly one cube + one HDR.
+
+    Note: this claims ``.hdr`` for ENVI — CVAT's previous treatment of .hdr
+    as Radiance HDR imagery is superseded for task-creation classification.
+    The ``EnviBsqReader`` treats the HDR as a sidecar, not an annotatable frame.
+    """
+    from cvat.apps.engine.hyperspectral import CUBE_SUFFIXES, is_hyperspectral_zip
+
+    suffix = os.path.splitext(path)[1].lower()
+    if suffix in CUBE_SUFFIXES or suffix == ".hdr":
+        return True
+    if suffix == ".zip":
+        return is_hyperspectral_zip(path)
+    return False
+
+
 # 'has_mime_type': function receives 1 argument - path to file.
 #                  Should return True if file has specified media type.
 # 'extractor': class that extracts images from specified media.
@@ -1169,7 +1343,16 @@ def _is_zip(path):
 #           True - only one item of this type and no other is allowed
 #           False - this media types can be combined with other which have unique is False
 
+# Ordering matters — ``get_mime`` returns the first match, so hyperspectral is
+# placed ahead of ``image`` so that ``.hdr`` sidecars are classified as
+# hyperspectral rather than as Radiance HDR imagery.
 MEDIA_TYPES = {
+    "hyperspectral": {
+        "has_mime_type": _is_hyperspectral,
+        "extractor": EnviBsqReader,
+        "mode": "annotation",
+        "unique": False,
+    },
     "image": {
         "has_mime_type": _is_image,
         "extractor": ImageListReader,
