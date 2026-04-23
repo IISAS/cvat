@@ -650,6 +650,17 @@ class MediaCache:
         db_task: models.Task, frame_ids: Sequence[int], *, decode: bool = True
     ) -> Generator[tuple[PIL.Image.Image | str, str], None, None]:
         db_data = db_task.require_data()
+
+        # Hyperspectral tasks: the stored Image.path points at the raw .bsq
+        # cube, which PIL cannot open. Compose the default-band RGBA on demand
+        # from the HyperspectralMetadata row instead. Custom-band requests go
+        # through the separate hyperspectral cache key.
+        if db_data.images.filter(hyperspectral__isnull=False).exists():
+            yield from MediaCache._read_raw_hyperspectral_frames(
+                db_task, frame_ids, bands=None, stretch=None,
+            )
+            return
+
         manifest_path = db_data.get_manifest_path()
 
         def requested_db_images():
