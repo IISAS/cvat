@@ -120,9 +120,15 @@ function receiveExtensions(files: RemoteFile[]): string[] {
 }
 
 function checkFiles(files: RemoteFile[], type: SupportedShareTypes, baseError: string): string {
-    const erroredFiles = files.filter(
-        (it) => it.mimeType !== type,
-    );
+    const erroredFiles = files.filter((it) => {
+        if (it.mimeType === type) return false;
+        // ENVI hyperspectral cubes and headers classify server-side as
+        // "hyperspectral"; treat them as valid image-type sources here so the
+        // share / cloud-storage file picker accepts them alongside a task's
+        // other images.
+        if (type === SupportedShareTypes.IMAGE && it.mimeType === 'hyperspectral') return false;
+        return true;
+    });
     if (erroredFiles.length !== 0) {
         const unsupportedTypes = receiveExtensions(erroredFiles);
         const extensionList = Array.from(new Set(unsupportedTypes));
