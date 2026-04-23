@@ -6,8 +6,22 @@ export function getFileContentTypeByMimeType(mimeType: string): string {
     return mimeType.split('/')[0];
 }
 
+// Browsers don't know ENVI hyperspectral MIMEs — `file.type` comes back empty
+// for .bsq/.img/.bil/.bip/.hdr. Treat them as "image" for the client-side
+// upload validator; the server still classifies them through its own MIME
+// map and routes them to the hyperspectral extractor.
+const HYPERSPECTRAL_EXTENSIONS = ['bsq', 'img', 'bil', 'bip', 'hdr'];
+
+function getExtension(name: string): string {
+    const idx = name.lastIndexOf('.');
+    return idx >= 0 ? name.slice(idx + 1).toLowerCase() : '';
+}
+
 export function getFileContentType(file: File): string {
-    return getFileContentTypeByMimeType(file.type);
+    const mimeContentType = getFileContentTypeByMimeType(file.type);
+    if (mimeContentType) return mimeContentType;
+    if (HYPERSPECTRAL_EXTENSIONS.includes(getExtension(file.name))) return 'image';
+    return mimeContentType;
 }
 
 export function checkFileTypesEqual(files: File[]): boolean {
