@@ -315,11 +315,17 @@ def _validate_hyperspectral_pairs(files: list[str]) -> None:
             stems_with_hdr.add(stem.lower())
         # .zip entries are validated by _is_hyperspectral at classification time.
 
+    _HINT = (
+        "Select the cube and its .hdr together in the file picker, or upload "
+        "them as a single .zip bundle."
+    )
     missing_hdr = stems_with_cube - stems_with_hdr
     if missing_hdr:
         raise ValueError(
-            "Hyperspectral cube(s) without a matching .hdr: "
+            "Hyperspectral cube(s) uploaded without a matching .hdr sidecar: "
             + ", ".join(sorted(missing_hdr))
+            + ". "
+            + _HINT
         )
     orphan_hdr = stems_with_hdr - stems_with_cube
     # A .hdr with no cube is only an error when there are no zipped bundles in
@@ -328,8 +334,11 @@ def _validate_hyperspectral_pairs(files: list[str]) -> None:
     # pairs as loose files or as a zipped bundle, not both.
     if orphan_hdr and not any(f.lower().endswith(".zip") for f in files):
         raise ValueError(
-            ".hdr file(s) without a matching cube (.bsq/.img/.bil/.bip): "
+            ".hdr file(s) uploaded without a matching cube "
+            "(.bsq/.img/.bil/.bip): "
             + ", ".join(sorted(orphan_hdr))
+            + ". "
+            + _HINT
         )
 
 
