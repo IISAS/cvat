@@ -1268,24 +1268,31 @@ def create_thread(
                 )
             )
             video_path = os.path.join(upload_dir, media_files[0])
-        else:  # images, archive, pdf
+        else:  # images, archive, pdf, hyperspectral
             db_data.size = len(extractor)
 
-            manifest = ImageManifestManager(db_data.get_manifest_path())
-            if not manifest.exists:
-                # TODO: Try to avoid adding manifest entries for images that are not in
-                # extractor.frame_range. In addition to less processing here, it would also allow
-                # us to avoid downloading such images from cloud storage (when using static chunks),
-                # or copying them from the attached share (when using copy_data).
-                manifest.link(
-                    sources=extractor.absolute_source_paths,
-                    meta={k: {"related_images": related_images[k]} for k in related_images},
-                    data_dir=upload_dir,
-                    DIM_3D=(db_task.dimension == models.DimensionType.DIM_3D),
-                )
-                manifest.create()
+            if isinstance(extractor, EnviBsqReader):
+                # Manifest generation opens each source path with PIL, which
+                # rejects .bsq/.img/.bil/.bip cubes. For hyperspectral tasks
+                # we skip the manifest entirely — image dimensions come from
+                # the extractor's cached HDR and chunks are served directly.
+                manifest = None
             else:
-                manifest.init_index()
+                manifest = ImageManifestManager(db_data.get_manifest_path())
+                if not manifest.exists:
+                    # TODO: Try to avoid adding manifest entries for images that are not in
+                    # extractor.frame_range. In addition to less processing here, it would also allow
+                    # us to avoid downloading such images from cloud storage (when using static chunks),
+                    # or copying them from the attached share (when using copy_data).
+                    manifest.link(
+                        sources=extractor.absolute_source_paths,
+                        meta={k: {"related_images": related_images[k]} for k in related_images},
+                        data_dir=upload_dir,
+                        DIM_3D=(db_task.dimension == models.DimensionType.DIM_3D),
+                    )
+                    manifest.create()
+                else:
+                    manifest.init_index()
 
             for frame_id in extractor.frame_range:
                 image_path = extractor.get_path(frame_id)
