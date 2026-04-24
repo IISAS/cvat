@@ -4,7 +4,7 @@ from django.db import migrations, models
 class Migration(migrations.Migration):
 
     dependencies = [
-        ("engine", "0096_add_annotation_score_field"),
+        ("engine", "0098_data_local_storage_backing_cs"),
     ]
 
     operations = [
