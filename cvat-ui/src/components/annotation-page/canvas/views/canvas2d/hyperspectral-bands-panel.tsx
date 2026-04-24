@@ -84,6 +84,7 @@ export default function HyperspectralBandsPanel(props: Props): JSX.Element | nul
     const { jobID } = props;
     const dispatch = useDispatch();
     const currentFrame = useSelector((state: CombinedState) => state.annotation.player.frame.number);
+    const canvasInstance = useSelector((state: CombinedState) => state.annotation.canvas.instance);
     const [meta, setMeta] = useState<HyperspectralFrameMeta | null>(null);
     const [loaded, setLoaded] = useState(false);
     const [state, setState] = useState<BandState | null>(null);
@@ -92,7 +93,15 @@ export default function HyperspectralBandsPanel(props: Props): JSX.Element | nul
     // Force a re-fetch of the current frame whenever bands change. cvat-core
     // already cleared the decoded-chunk cache; this triggers the actual
     // network round-trip + canvas redraw.
+    //
+    // Without forceFrameUpdate the canvas short-circuits setup() when the
+    // target frame number equals the currently displayed one — see
+    // canvasModel.ts:558. changeFrameAsync fetches new FrameData but the
+    // canvas refuses to draw it until forceFrameUpdate flips.
     const refetchCurrentFrame = (): void => {
+        if (canvasInstance && 'configure' in canvasInstance) {
+            canvasInstance.configure({ forceFrameUpdate: true });
+        }
         dispatch(changeFrameAsync(currentFrame, undefined, undefined, true));
     };
 
