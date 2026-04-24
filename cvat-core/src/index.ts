@@ -176,6 +176,32 @@ export default interface CVATCore {
     };
     frames: {
         getMeta: (type: 'task' | 'job', id: number) => Promise<FramesMetaData>;
+        getHyperspectralMeta: (jobID: number) => Promise<{
+            frames: {
+                frame: number;
+                band_count: number;
+                lines: number;
+                samples: number;
+                interleave: string;
+                dtype: string;
+                default_r_band: number;
+                default_g_band: number;
+                default_b_band: number;
+                default_stretch: string[] | null;
+                wavelengths: number[] | null;
+                data_ignore_value: number | null;
+            }[];
+        }>;
+        setHyperspectralBands: (
+            jobID: number,
+            bands: {
+                rBand: number;
+                gBand: number;
+                bBand: number;
+                stretchLo?: number;
+                stretchHi?: number;
+            } | null,
+        ) => Promise<void>;
     };
     requests: {
         list: () => Promise<PaginatedResource<Request>>;

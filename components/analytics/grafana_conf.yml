@@ -8,15 +8,6 @@ http:
       - strip-prefix
       service: grafana
       rule: Host(`{{ env "CVAT_HOST" }}`) && PathPrefix(`/analytics`)
-    grafana_https:
-      entryPoints:
-      - websecure
-      middlewares:
-      - analytics-auth
-      - strip-prefix
-      service: grafana
-      tls: {}
-      rule: Host(`{{ env "CVAT_HOST" }}`) && PathPrefix(`/analytics`)
 
   middlewares:
     analytics-auth:

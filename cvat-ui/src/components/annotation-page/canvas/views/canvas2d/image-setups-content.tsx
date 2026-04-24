@@ -26,6 +26,7 @@ import {
 import { clamp } from 'utils/math';
 import { GridColor, CombinedState, PlayerSettingsState } from 'reducers';
 import GammaFilter from './gamma-filter';
+import HyperspectralBandsPanel from './hyperspectral-bands-panel';
 
 const minGridSize = 5;
 const maxGridSize = 1000;
@@ -41,6 +42,7 @@ export default function ImageSetupsContent(): JSX.Element {
         gridSize,
         grid: gridEnabled,
     } = useSelector((state: CombinedState): PlayerSettingsState => state.settings.player);
+    const jobID = useSelector((state: CombinedState) => state.annotation.job.instance?.id ?? null);
 
     return (
         <div className='cvat-canvas-image-setups-content'>
@@ -190,6 +192,7 @@ export default function ImageSetupsContent(): JSX.Element {
                     </Button>
                 </Col>
             </Row>
+            {jobID !== null && <HyperspectralBandsPanel jobID={jobID} />}
         </div>
     );
 }

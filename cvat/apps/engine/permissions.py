@@ -1012,6 +1012,9 @@ class JobPermission(OpenPolicyAgentPermission, DownloadExportedExtension):
             ("data", "GET"): Scopes.VIEW_DATA,
             ("metadata", "GET"): Scopes.VIEW_METADATA,
             ("metadata", "PATCH"): Scopes.UPDATE_METADATA,
+            # Hyperspectral band/stretch metadata is a read-only subset of the
+            # job's data meta, so it maps to the same VIEW_METADATA scope.
+            ("hyperspectral_meta", "GET"): Scopes.VIEW_METADATA,
             ("initiate_dataset_export", "POST"): (
                 Scopes.EXPORT_DATASET if is_dataset_export(request) else Scopes.EXPORT_ANNOTATIONS
             ),

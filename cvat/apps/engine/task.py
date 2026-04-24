@@ -31,6 +31,7 @@ from cvat.apps.engine.log import ServerLogManager
 from cvat.apps.engine.media_extractors import (
     MEDIA_TYPES,
     CachingMediaIterator,
+    EnviBsqReader,
     ImageListReader,
     IMediaReader,
     Mpeg4ChunkWriter,
@@ -294,7 +295,57 @@ def _find_manifest_files(data):
     return manifest_files
 
 
+def _validate_hyperspectral_pairs(files: list[str]) -> None:
+    """Every cube file (.bsq/.img/.bil/.bip) must have a matching .hdr sidecar
+    (or be a .zip with the pair inside; zips were pre-validated at
+    classification time). A lone .hdr with no cube is rejected — it's either a
+    misnamed upload or a missing-file mistake.
+    """
+    from cvat.apps.engine.hyperspectral import CUBE_SUFFIXES
+
+    stems_with_cube: set[str] = set()
+    stems_with_hdr: set[str] = set()
+    for f in files:
+        base = os.path.basename(f)
+        stem, suffix = os.path.splitext(base)
+        suffix = suffix.lower()
+        if suffix in CUBE_SUFFIXES:
+            stems_with_cube.add(stem.lower())
+        elif suffix == ".hdr":
+            stems_with_hdr.add(stem.lower())
+        # .zip entries are validated by _is_hyperspectral at classification time.
+
+    _HINT = (
+        "Select the cube and its .hdr together in the file picker, or upload "
+        "them as a single .zip bundle."
+    )
+    missing_hdr = stems_with_cube - stems_with_hdr
+    if missing_hdr:
+        raise ValueError(
+            "Hyperspectral cube(s) uploaded without a matching .hdr sidecar: "
+            + ", ".join(sorted(missing_hdr))
+            + ". "
+            + _HINT
+        )
+    orphan_hdr = stems_with_hdr - stems_with_cube
+    # A .hdr with no cube is only an error when there are no zipped bundles in
+    # the batch. We can't cheaply tell here whether some zip happens to contain
+    # a cube with this HDR's name; in practice users either upload cube+hdr
+    # pairs as loose files or as a zipped bundle, not both.
+    if orphan_hdr and not any(f.lower().endswith(".zip") for f in files):
+        raise ValueError(
+            ".hdr file(s) uploaded without a matching cube "
+            "(.bsq/.img/.bil/.bip): "
+            + ", ".join(sorted(orphan_hdr))
+            + ". "
+            + _HINT
+        )
+
+
 def _validate_data(counter, manifest_files=None):
+    if counter.get("hyperspectral"):
+        _validate_hyperspectral_pairs(counter["hyperspectral"])
+
     unique_entries = 0
     multiple_entries = 0
     for media_type, media_config in MEDIA_TYPES.items():
@@ -1603,6 +1654,244 @@ def create_thread(
                 )
             )
             video_path = os.path.join(upload_dir, media_files[0])
+        else:  # images, archive, pdf, hyperspectral
+            db_data.size = len(extractor)
+
+            if isinstance(extractor, EnviBsqReader):
+                # Manifest generation opens each source path with PIL, which
+                # rejects .bsq/.img/.bil/.bip cubes. For hyperspectral tasks
+                # we skip the manifest entirely — image dimensions come from
+                # the extractor's cached HDR and chunks are served directly.
+                manifest = None
+            else:
+                manifest = ImageManifestManager(db_data.get_manifest_path())
+                if not manifest.exists:
+                    # TODO: Try to avoid adding manifest entries for images that are not in
+                    # extractor.frame_range. In addition to less processing here, it would also allow
+                    # us to avoid downloading such images from cloud storage (when using static chunks),
+                    # or copying them from the attached share (when using copy_data).
+                    manifest.link(
+                        sources=extractor.absolute_source_paths,
+                        meta={k: {"related_images": related_images[k]} for k in related_images},
+                        data_dir=upload_dir,
+                        DIM_3D=(db_task.dimension == models.DimensionType.DIM_3D),
+                    )
+                    manifest.create()
+                else:
+                    manifest.init_index()
+
+            for frame_id in extractor.frame_range:
+                image_path = extractor.get_path(frame_id)
+                image_size = None
+
+                if manifest:
+                    image_info = manifest[frame_id]
+
+                    # check mapping
+                    if not image_path.as_posix().endswith(
+                        f"{image_info['name']}{image_info['extension']}"
+                    ):
+                        raise ValidationError("Incorrect file mapping to manifest content")
+
+                    if image_info.get("width") is not None and image_info.get("height") is not None:
+                        image_size = (image_info["width"], image_info["height"])
+                    elif is_data_in_cloud:
+                        raise ValidationError(
+                            "Can't find image '{}' width or height info in the manifest".format(
+                                f"{image_info['name']}{image_info['extension']}"
+                            )
+                        )
+
+                if not image_size:
+                    image_size = extractor.get_image_size(frame_id)
+
+                images.append(
+                    models.Image(
+                        data=db_data,
+                        path=os.path.relpath(image_path, upload_dir),
+                        frame=frame_id,
+                        width=image_size[0],
+                        height=image_size[1],
+                    )
+                )
+
+    # TODO: refactor
+    # Prepare jobs
+    if validation_params and (
+        validation_params["mode"] == models.ValidationMode.GT_POOL and is_backup_restore
+    ):
+        # Validation frames must be in the end of the images list. Collect their ids
+        frame_idx_map: dict[str, int] = {}
+        for i, frame_filename in enumerate(validation_params["frames"]):
+            image = images[-len(validation_params["frames"]) + i]
+            assert frame_filename == image.path
+            frame_idx_map[image.path] = image.frame
+
+        # Store information about the real frame placement in validation frames in jobs
+        for image in images[: -len(validation_params["frames"])]:
+            real_frame = frame_idx_map.get(image.path)
+            if real_frame is not None:
+                image.is_placeholder = True
+                image.real_frame = real_frame
+
+        # Exclude the previous GT job from the list of jobs to be created with normal segments
+        # It must be the last one
+        assert job_file_mapping[-1] == validation_params["frames"]
+        job_file_mapping.pop(-1)
+
+        db_data.update_validation_layout(
+            models.ValidationLayout(
+                mode=models.ValidationMode.GT_POOL,
+                frames=list(frame_idx_map.values()),
+                frames_per_job_count=validation_params["frames_per_job_count"],
+            )
+        )
+    elif validation_params and validation_params["mode"] == models.ValidationMode.GT_POOL:
+        if db_task.mode != "annotation":
+            raise ValidationError(
+                f"validation mode '{models.ValidationMode.GT_POOL}' can only be used "
+                "with 'annotation' mode tasks"
+            )
+
+        # 1. select pool frames
+        all_frames = range(len(images))
+
+        # The RNG backend must not change to yield reproducible frame picks,
+        # so here we specify it explicitly
+        from numpy import random
+
+        seed = validation_params.get("random_seed")
+        rng = random.Generator(random.MT19937(seed=seed))
+
+        # Sort the images to be able to create reproducible results
+        images = sort(images, sorting_method=models.SortingMethod.NATURAL, func=lambda i: i.path)
+        for i, image in enumerate(images):
+            image.frame = i
+
+        pool_frames: list[int] = []
+        match validation_params["frame_selection_method"]:
+            case models.JobFrameSelectionMethod.RANDOM_UNIFORM:
+                if frame_count := validation_params.get("frame_count"):
+                    if len(images) <= frame_count:
+                        raise ValidationError(
+                            f"The number of validation frames requested ({frame_count}) "
+                            f"must be less than the number of task frames ({len(images)})"
+                        )
+                elif frame_share := validation_params.get("frame_share"):
+                    frame_count = max(1, int(len(images) * frame_share))
+                else:
+                    raise ValidationError("The number of validation frames is not specified")
+
+                pool_frames = rng.choice(
+                    all_frames, size=frame_count, shuffle=False, replace=False
+                ).tolist()
+            case models.JobFrameSelectionMethod.MANUAL:
+                known_frame_names = {frame.path: frame.frame for frame in images}
+                unknown_requested_frames = []
+                for frame_filename in validation_params["frames"]:
+                    frame_id = known_frame_names.get(frame_filename)
+                    if frame_id is None:
+                        unknown_requested_frames.append(frame_filename)
+                        continue
+
+                    pool_frames.append(frame_id)
+
+                if unknown_requested_frames:
+                    raise ValidationError(
+                        "Unknown validation frames requested: {}".format(
+                            format_list(sorted(unknown_requested_frames))
+                        )
+                    )
+            case _:
+                assert False
+
+        if len(all_frames) - len(pool_frames) < 1:
+            raise ValidationError(
+                "Cannot create task: "
+                "too few non-honeypot frames left after selecting validation frames"
+            )
+
+        # Even though the sorting is random overall,
+        # it's convenient to be able to reasonably navigate in the GT job
+        pool_frames = sort(
+            pool_frames,
+            sorting_method=models.SortingMethod.NATURAL,
+            func=lambda frame: images[frame].path,
+        )
+
+        # 2. distribute pool frames
+        if frames_per_job_count := validation_params.get("frames_per_job_count"):
+            if len(pool_frames) < frames_per_job_count and validation_params.get("frame_count"):
+                raise ValidationError(
+                    f"The requested number of validation frames per job ({frames_per_job_count}) "
+                    f"is greater than the validation pool size ({len(pool_frames)})"
+                )
+        elif frames_per_job_share := validation_params.get("frames_per_job_share"):
+            frames_per_job_count = max(1, int(frames_per_job_share * db_task.segment_size))
+        else:
+            raise ValidationError("The number of validation frames is not specified")
+
+        frames_per_job_count = min(len(pool_frames), frames_per_job_count)
+
+        non_pool_frames = sorted(
+            # set() doesn't guarantee ordering,
+            # so sort additionally before shuffling to make results reproducible
+            set(all_frames).difference(pool_frames)
+        )
+        rng.shuffle(non_pool_frames)
+
+        validation_frame_counts = {f: 0 for f in pool_frames}
+        frame_selector = HoneypotFrameSelector(validation_frame_counts, rng=rng)
+
+        # Don't use the same rng as for frame ordering to simplify random_seed maintenance in future
+        # We still use the same seed, but in this case the frame selection rng is separate
+        # from job frame ordering rng
+        job_frame_ordering_rng = random.Generator(random.MT19937(seed=seed))
+
+        # Allocate frames for jobs
+        job_file_mapping: JobFileMapping = []
+        new_db_images: list[models.Image] = []
+        validation_frames: list[int] = []
+        frame_idx_map: dict[int, int] = {}  # new to original id
+        for job_frames in take_by(non_pool_frames, chunk_size=db_task.segment_size or db_data.size):
+            job_validation_frames = list(frame_selector.select_next_frames(frames_per_job_count))
+            job_frames += job_validation_frames
+
+            job_frame_ordering_rng.shuffle(job_frames)
+
+                except Exception as ex:
+                    manifest.remove()
+                    manifest = None
+
+                    if isinstance(ex, AssertionError):
+                        base_msg = f": {ex}"
+                    else:
+                        base_msg = ""
+                        slogger.glob.warning(ex, exc_info=True)
+
+                    update_status(
+                        f"Failed to create manifest for the uploaded video{base_msg}. "
+                        "A manifest will not be used in this task"
+                    )
+
+            if manifest:
+                video_frame_count = manifest.video_length
+                video_frame_size = manifest.video_resolution
+            else:
+                video_frame_count = extractor.get_frame_count()
+                video_frame_size = extractor.get_image_size(0)
+
+            db_data.size = len(
+                range(
+                    db_data.start_frame,
+                    min(
+                        data["stop_frame"] + 1 if data["stop_frame"] else video_frame_count,
+                        video_frame_count,
+                    ),
+                    db_data.get_frame_step(),
+                )
+            )
+            video_path = os.path.join(upload_dir, media_files[0])
         else:  # images, archive, pdf
             db_data.size = len(extractor)
 
@@ -1668,6 +1957,32 @@ def create_thread(
         )
 
         images = bulk_create(models.Image, images)
+
+        if isinstance(extractor, EnviBsqReader):
+            hs_rows = []
+            for img in images:
+                info = extractor.get_header_info(img.frame)
+                hs_rows.append(
+                    models.HyperspectralMetadata(
+                        image=img,
+                        band_count=info.band_count,
+                        lines=info.lines,
+                        samples=info.samples,
+                        interleave=info.interleave,
+                        dtype=info.dtype,
+                        default_r_band=info.default_r_band,
+                        default_g_band=info.default_g_band,
+                        default_b_band=info.default_b_band,
+                        default_stretch=info.default_stretch,
+                        wavelengths=info.wavelengths,
+                        data_ignore_value=info.data_ignore_value,
+                        crs_wkt=info.crs_wkt,
+                        map_info=info.map_info,
+                        data_file_path=os.path.abspath(extractor.get_path(img.frame)),
+                        hdr_file_path=os.path.abspath(extractor.get_hdr_path(img.frame)),
+                    )
+                )
+            bulk_create(models.HyperspectralMetadata, hs_rows)
 
         db_related_files = [
             models.RelatedFile(

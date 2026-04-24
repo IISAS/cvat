@@ -243,6 +243,43 @@ class TaskFrameProvider(IFrameProvider):
     def get_preview(self) -> DataWithMeta[BytesIO]:
         return self._get_segment_frame_provider(0).get_preview()
 
+    def get_hyperspectral_chunk(
+        self,
+        chunk_number: int,
+        *,
+        quality: models.FrameQuality = models.FrameQuality.ORIGINAL,
+        bands: tuple[int, int, int] | None,
+        stretch: tuple[float, float] | None,
+    ) -> DataWithMeta[BytesIO]:
+        """Task-level hyperspectral chunk getter.
+
+        Tasks with more than one segment that span a single chunk are not
+        supported for custom-band rendering in MVP — we delegate to the first
+        matching segment, which covers the common single-segment case.
+        """
+        chunk_number = self.validate_chunk_number(chunk_number)
+        db_data = self._db_task.require_data()
+        step = db_data.get_frame_step()
+        task_chunk_frame_set = set(
+            range(
+                db_data.start_frame + chunk_number * db_data.chunk_size * step,
+                min(
+                    db_data.start_frame + ((chunk_number + 1) * db_data.chunk_size - 1) * step,
+                    db_data.stop_frame,
+                ) + step,
+                step,
+            )
+        )
+        matching_segments = [
+            s for s in self._db_task.segment_set.all()
+            if not task_chunk_frame_set.isdisjoint(s.frame_set)
+        ]
+        if not matching_segments:
+            raise ValidationError(f"No segment matches chunk {chunk_number}")
+        return SegmentFrameProvider(matching_segments[0]).get_hyperspectral_chunk(
+            chunk_number, quality=quality, bands=bands, stretch=stretch,
+        )
+
     def get_chunk(
         self, chunk_number: int, *, quality: models.FrameQuality = models.FrameQuality.ORIGINAL
     ) -> DataWithMeta[BytesIO]:
@@ -565,6 +602,27 @@ class SegmentFrameProvider(IFrameProvider):
         chunk_number = self.validate_chunk_number(chunk_number)
         chunk_data, mime = self._loaders[quality].read_chunk(chunk_number)
         return DataWithMeta[BytesIO](chunk_data, mime=mime)
+
+    def get_hyperspectral_chunk(
+        self,
+        chunk_number: int,
+        *,
+        quality: models.FrameQuality = models.FrameQuality.ORIGINAL,
+        bands: tuple[int, int, int] | None,
+        stretch: tuple[float, float] | None,
+    ) -> DataWithMeta[BytesIO]:
+        """Chunk getter that re-composites each frame from its raw cube.
+
+        Bypasses the per-instance ``_ChunkLoader`` cache because band selection
+        changes frequently. The ``MediaCache`` layer still caches the rendered
+        chunk under a signature-extended key.
+        """
+        chunk_number = self.validate_chunk_number(chunk_number)
+        cache = MediaCache()
+        buffer, mime = cache.get_or_set_hyperspectral_segment_chunk(
+            self._db_segment, chunk_number, quality=quality, bands=bands, stretch=stretch,
+        )
+        return DataWithMeta[BytesIO](buffer, mime=mime)
 
     def invalidate_chunks(self, *, quality: models.FrameQuality = models.FrameQuality.ORIGINAL):
         cache = MediaCache()
