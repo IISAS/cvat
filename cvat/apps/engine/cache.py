@@ -454,6 +454,11 @@ class MediaCache:
                 db_segment, chunk_number, quality=quality
             )
 
+        # Callback._kwargs is validated as primitives only (serializable into
+        # Redis for RQ workers). Flatten the tuples into named ints/floats;
+        # prepare_hyperspectral_segment_chunk reconstitutes them.
+        r, g, b = bands if bands is not None else (None, None, None)
+        lo, hi = stretch if stretch is not None else (None, None)
         item = self._get_or_set_cache_item(
             self._make_chunk_key(
                 db_segment, chunk_number, quality=quality, hyperspectral_signature=signature
@@ -461,7 +466,14 @@ class MediaCache:
             Callback(
                 callable=self.prepare_hyperspectral_segment_chunk,
                 args=[db_segment, chunk_number],
-                kwargs={"quality": quality, "bands": bands, "stretch": stretch},
+                kwargs={
+                    "quality": quality,
+                    "r_band": r,
+                    "g_band": g,
+                    "b_band": b,
+                    "stretch_lo": lo,
+                    "stretch_hi": hi,
+                },
             ),
         )
         db_segment.refresh_from_db(fields=["chunks_updated_date"])
@@ -956,14 +968,18 @@ class MediaCache:
         chunk_number: int,
         *,
         quality: models.FrameQuality,
-        bands: tuple[int, int, int] | None,
-        stretch: tuple[float, float] | None,
+        r_band: int | None,
+        g_band: int | None,
+        b_band: int | None,
+        stretch_lo: float | None,
+        stretch_hi: float | None,
     ) -> DataWithMime:
         """Build a chunk whose frames are rendered on demand from raw cubes.
 
-        Always composites freshly — the whole point of custom-band requests is
-        that they bypass the pre-built default chunks. The resulting chunk is
-        cached under the hyperspectral-signed key by the caller.
+        Band / stretch kwargs are flattened to primitives because ``Callback``
+        only accepts primitive kwargs (Redis serialization for RQ workers).
+        They are reconstituted here before being passed to the per-frame
+        renderer.
         """
         if isinstance(db_segment, int):
             db_segment = models.Segment.objects.get(pk=db_segment)
@@ -975,6 +991,8 @@ class MediaCache:
             chunk_size * chunk_number : chunk_size * (chunk_number + 1)
         ]
 
+        bands = (r_band, g_band, b_band) if r_band is not None else None
+        stretch = (stretch_lo, stretch_hi) if stretch_lo is not None else None
         frame_iter = self._read_raw_hyperspectral_frames(
             db_task, chunk_frame_ids, bands=bands, stretch=stretch,
         )
